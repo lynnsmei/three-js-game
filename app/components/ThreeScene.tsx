@@ -3,14 +3,21 @@ import * as THREE from "three";
 import type { KeyState } from "../game/utils/types";
 import { setupLighting, createGround } from "../game/environment/Lighting";
 import { createMap } from "../game/environment/Map";
-import { createPlayerWeapon, createBullet } from "../game/entities/Player";
-import { createTarget, updateTargets, targetTypes } from "../game/entities/Target";
-import { updateBullets } from "../game/entities/Bullet";
-import { setupMouseControls, handleShoot } from "../game/controls/MouseControls";
+import { createTarget, updateTargets } from "../game/entities/Target";
+import { setupMouseControls } from "../game/controls/MouseControls";
 import { setupKeyboardControls, handleMovement } from "../game/controls/KeyboardControls";
 import { findSafeSpawnPosition } from "../game/utils/Collision";
 import { Debug } from "./Debug";
 import { GameUI } from "./GameUI";
+import { 
+  WeaponType, 
+  type Weapon, 
+  initializeWeapon, 
+  handleWeaponFire, 
+  updateWeapon, 
+  startReload,
+  updateBullets
+} from "../game/entities/Weapons";
 
 export function ThreeScene() {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -18,12 +25,25 @@ export function ThreeScene() {
   const [gameOver, setGameOver] = useState(false);
   const [timeLeft, setTimeLeft] = useState(60);
   const [debug, setDebug] = useState(false);
+  const [currentWeaponType, setCurrentWeaponType] = useState<WeaponType>(WeaponType.PISTOL);
+  
+  // Refs for game state that needs to be accessed in event handlers
   const keyStateRef = useRef<KeyState>({
     w: false,
     a: false,
     s: false,
     d: false,
   });
+  const weaponRef = useRef<Weapon | null>(null);
+  const bulletsRef = useRef<THREE.Mesh[]>([]);
+  const gameActiveRef = useRef(true);
+  
+  // State for UI
+  const [ammo, setAmmo] = useState(0);
+  const [maxAmmo, setMaxAmmo] = useState(0);
+  const [isReloading, setIsReloading] = useState(false);
+  
+  // Debug data
   const [debugData, setDebugData] = useState({
     targets: [] as THREE.Mesh[],
     bullets: [] as THREE.Mesh[],
@@ -31,17 +51,49 @@ export function ThreeScene() {
     camera: null as THREE.Camera | null,
   });
   
+  // Handle weapon switching
+  const handleWeaponSelect = (weaponType: WeaponType) => {
+    if (!gameActiveRef.current || weaponType === currentWeaponType) return;
+    setCurrentWeaponType(weaponType);
+  };
+  
+  // Handle manual reload
+  const handleReload = () => {
+    if (!gameActiveRef.current || !weaponRef.current || weaponRef.current.isReloading) return;
+    startReload(weaponRef.current);
+  };
+  
+  // Effect for weapon switching
+  useEffect(() => {
+    if (!debugData.camera || !gameActiveRef.current) return;
+    
+    // Remove old weapon model from camera
+    if (weaponRef.current?.model) {
+      debugData.camera.remove(weaponRef.current.model);
+    }
+    
+    // Create new weapon
+    const newWeapon = initializeWeapon(currentWeaponType);
+    weaponRef.current = newWeapon;
+    
+    // Add new weapon model to camera
+    debugData.camera.add(newWeapon.model!);
+    
+    // Update UI
+    setAmmo(newWeapon.ammo);
+    setMaxAmmo(newWeapon.maxAmmo);
+    setIsReloading(newWeapon.isReloading);
+    
+  }, [currentWeaponType, debugData.camera]);
+  
   useEffect(() => {
     if (!mountRef.current) return;
 
     // Game state
-    let bullets: THREE.Mesh[] = [];
     let targets: THREE.Mesh[] = [];
-    let gameActive = true;
+    gameActiveRef.current = true;
     let lastFrameTime = performance.now();
-    
-    // Movement state - use the ref
-    const keyState = keyStateRef.current;
+    bulletsRef.current = [];
     
     // Scene setup
     const scene = new THREE.Scene();
@@ -58,7 +110,7 @@ export function ThreeScene() {
       1000
     );
     
-    // Store camera in debug data immediately
+    // Store camera in debug data
     setDebugData(prev => ({
       ...prev,
       camera: camera
@@ -80,19 +132,51 @@ export function ThreeScene() {
     const safePosition = findSafeSpawnPosition(scene);
     camera.position.copy(safePosition);
     
-    // Create player weapon
-    createPlayerWeapon(camera);
+    // Initialize weapon system
+    const initialWeapon = initializeWeapon(currentWeaponType);
+    weaponRef.current = initialWeapon;
+    
+    // Add weapon model to camera
+    camera.add(initialWeapon.model!);
+    
+    // Update UI with initial weapon stats
+    setAmmo(initialWeapon.ammo);
+    setMaxAmmo(initialWeapon.maxAmmo);
+    setIsReloading(initialWeapon.isReloading);
     
     // Setup controls
     const mouseControls = setupMouseControls(camera, mountRef);
-    const keyboardControls = setupKeyboardControls(keyState, setDebug);
+    const keyboardControls = setupKeyboardControls(keyStateRef.current, setDebug);
     
     // Click to shoot
     const handleClick = () => {
-      if (!gameActive) return;
-      handleShoot(camera, scene, bullets, createBullet);
+      if (!gameActiveRef.current || !weaponRef.current) return;
+      
+      if (handleWeaponFire(camera, scene, weaponRef.current, bulletsRef.current)) {
+        // Update UI after firing
+        setAmmo(weaponRef.current.ammo);
+        setIsReloading(weaponRef.current.isReloading);
+      }
     };
     window.addEventListener("click", handleClick);
+    
+    // Keyboard handler for weapon switching and reload
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Number keys 1-4 for weapon selection
+      if (e.key >= '1' && e.key <= '4') {
+        const weaponIndex = parseInt(e.key) - 1;
+        const weaponTypes = Object.values(WeaponType);
+        if (weaponIndex < weaponTypes.length) {
+          handleWeaponSelect(weaponTypes[weaponIndex]);
+        }
+      }
+      
+      // R key for reload
+      if (e.key === 'r') {
+        handleReload();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
     
     // Spawn targets periodically
     const spawnTarget = () => {
@@ -109,18 +193,18 @@ export function ThreeScene() {
     
     // Target spawner
     const targetSpawner = setInterval(() => {
-      if (gameActive) {
+      if (gameActiveRef.current) {
         spawnTarget();
       }
     }, 2000);
     
     // Game timer
     const gameTimer = setInterval(() => {
-      if (gameActive) {
+      if (gameActiveRef.current) {
         setTimeLeft(prev => {
           if (prev <= 1) {
             // Game over
-            gameActive = false;
+            gameActiveRef.current = false;
             setGameOver(true);
             return 0;
           }
@@ -136,25 +220,36 @@ export function ThreeScene() {
       
       requestAnimationFrame(animate);
       
-      if (gameActive) {
+      if (gameActiveRef.current) {
         // Handle player movement
-        handleMovement(camera, keyState, scene);
+        handleMovement(camera, keyStateRef.current, scene);
         
         // Update targets
         updateTargets(targets, camera, scene, now);
         
-        // Update bullets
-        updateBullets(bullets, targets, scene, setScore);
-        
-        // Update debug data if debug mode is on
-        if (debug) {
-          setDebugData({
-            targets,
-            bullets,
-            lastFrameTime: now,
-            camera: camera,
-          });
+        // Update weapon state
+        if (weaponRef.current) {
+          updateWeapon(weaponRef.current);
+          
+          // Update UI if weapon state changed
+          if (weaponRef.current.ammo !== ammo) {
+            setAmmo(weaponRef.current.ammo);
+          }
+          if (weaponRef.current.isReloading !== isReloading) {
+            setIsReloading(weaponRef.current.isReloading);
+          }
         }
+        
+        // Update bullets and check for collisions
+        updateBullets(bulletsRef.current, targets, scene, camera, setScore);
+        
+        // Update debug data
+        setDebugData({
+          targets,
+          bullets: bulletsRef.current,
+          lastFrameTime: now,
+          camera
+        });
       }
       
       renderer.render(scene, camera);
@@ -175,6 +270,7 @@ export function ThreeScene() {
     return () => {
       window.removeEventListener("click", handleClick);
       window.removeEventListener("resize", handleResize);
+      window.removeEventListener("keydown", handleKeyDown);
       clearInterval(gameTimer);
       clearInterval(targetSpawner);
       
@@ -212,6 +308,12 @@ export function ThreeScene() {
         timeLeft={timeLeft}
         gameOver={gameOver}
         onRestart={handleRestart}
+        currentWeapon={currentWeaponType}
+        ammo={ammo}
+        maxAmmo={maxAmmo}
+        isReloading={isReloading}
+        onWeaponSelect={handleWeaponSelect}
+        onReload={handleReload}
       />
       
       {debug && debugData.camera && (
